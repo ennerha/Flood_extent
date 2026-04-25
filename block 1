@@ -1,0 +1,119 @@
+# ============================================================
+# BLOCK 1 — FULL SETUP CORRIGIDO
+# DRIVE + EE + BRAZIL + MUNICIPALITIES + GFD + HAND
+# ============================================================
+
+!pip -q install geemap geopandas cartopy pyogrio mapclassify rasterio geobr
+
+import ee
+import geemap
+import pandas as pd
+import geopandas as gpd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from pathlib import Path
+from google.colab import drive
+from geobr import read_municipality
+
+# ------------------------------------------------------------
+# Mount Google Drive
+# ------------------------------------------------------------
+
+drive.mount("/content/drive")
+
+OUT = Path("/content/drive/MyDrive/flood_extent_vs_hydraulic_hazard_brazil")
+OUT.mkdir(parents=True, exist_ok=True)
+
+print("Output folder:", OUT)
+
+# ------------------------------------------------------------
+# Earth Engine authentication
+# ------------------------------------------------------------
+
+EE_PROJECT = "ee-enneralcantara2"
+
+try:
+    ee.Initialize(project=EE_PROJECT)
+    print("Earth Engine initialized.")
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=EE_PROJECT)
+    print("Earth Engine authenticated and initialized.")
+
+# ------------------------------------------------------------
+# Brazil boundary
+# ------------------------------------------------------------
+
+countries = ee.FeatureCollection("FAO/GAUL/2015/level0")
+brazil_fc = countries.filter(ee.Filter.eq("ADM0_NAME", "Brazil"))
+brazil = brazil_fc.geometry()
+
+# ------------------------------------------------------------
+# Municipalities from official IBGE/geobr
+# ------------------------------------------------------------
+
+muni_gdf_path = OUT / "ibge_municipalities_2022.gpkg"
+
+if muni_gdf_path.exists():
+    gmun = gpd.read_file(muni_gdf_path)
+    print("Loaded municipalities from Drive.")
+else:
+    gmun = read_municipality(code_muni="all", year=2022)
+    gmun = gmun.to_crs("EPSG:4674")
+    gmun.to_file(muni_gdf_path, driver="GPKG")
+    print("Downloaded municipalities from geobr/IBGE and saved to Drive.")
+
+print("Municipality columns:")
+print(gmun.columns.tolist())
+
+print("Number of municipalities:", len(gmun))
+
+# ------------------------------------------------------------
+# Simplify geometry for Earth Engine reduceRegions
+# ------------------------------------------------------------
+
+muni_simplified_path = OUT / "ibge_municipalities_2022_simplified.geojson"
+
+if muni_simplified_path.exists():
+    gmun_simpl = gpd.read_file(muni_simplified_path)
+    print("Loaded simplified municipalities from Drive.")
+else:
+    gmun_simpl = gmun.copy()
+    gmun_simpl["geometry"] = gmun_simpl.geometry.simplify(
+        tolerance=0.01,
+        preserve_topology=True
+    )
+    gmun_simpl.to_file(muni_simplified_path, driver="GeoJSON")
+    print("Saved simplified municipalities to Drive.")
+
+# Convert to Earth Engine FeatureCollection
+muni = geemap.geopandas_to_ee(gmun_simpl)
+
+# ------------------------------------------------------------
+# Global Flood Database
+# ------------------------------------------------------------
+
+gfd = ee.ImageCollection("GLOBAL_FLOOD_DB/MODIS_EVENTS/V1").filterBounds(brazil)
+
+# ------------------------------------------------------------
+# MERIT Hydro HAND
+# ------------------------------------------------------------
+
+hand = ee.Image("MERIT/Hydro/v1_0_1").select("hnd").clip(brazil)
+
+# ------------------------------------------------------------
+# Checks
+# ------------------------------------------------------------
+
+print("Number of GFD events intersecting Brazil:", gfd.size().getInfo())
+
+first_event = ee.Image(gfd.first())
+
+print("Sample GFD event properties:")
+print(first_event.toDictionary().getInfo())
+
+print("HAND projection:")
+print(hand.projection().getInfo())
