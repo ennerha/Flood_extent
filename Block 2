@@ -1,0 +1,1267 @@
+# =============================================================================
+# FLOOD EXTENT vs HYDRAULIC HAZARD — BRAZIL
+# Nature Comment — Production Notebook
+# =============================================================================
+#
+# KEY DESIGN DECISION (Block 4/5):
+#   Two separate GEE exports per UF:
+#   1. muni_stats_IBGE_{UF}: flood area + frequency + HAND percentiles
+#      (masked to flooded pixels — physically correct for observed severity)
+#   2. muni_hand_IBGE_{UF}: HAND class histogram over ALL municipal pixels
+#      (NOT flood-masked — correct for structural hazard of the territory)
+#
+#   Joined locally in pandas on CD_MUN after download.
+#   This avoids the server-side Join bug that returned empty histograms.
+# =============================================================================
+
+# =============================================================================
+# BLOCK 1 — INSTALLATION, AUTHENTICATION, CONSTANTS
+# =============================================================================
+
+!apt-get -q install -y libgeos-dev libproj-dev 2>/dev/null
+!pip -q install earthengine-api geemap geopandas pyogrio mapclassify rasterio cartopy tenacity rich pysal libpysal esda spreg scipy statsmodels scikit-learn tqdm
+
+import ee, json, math, time, logging, zipfile, io, requests, warnings
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
+import matplotlib.gridspec as gridspec
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import scipy.stats as stats
+
+from pathlib import Path
+from datetime import datetime
+from IPython import display as IPydisplay
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from rich.console import Console
+from rich.table import Table
+from rich import print as rprint
+from tqdm.notebook import tqdm as tqdm_nb
+from libpysal.weights import KNN
+from esda.moran import Moran
+from spreg import ML_Lag
+
+warnings.filterwarnings('ignore')
+
+EE_PROJECT   = 'ee-enneralcantara2'
+DRIVE_FOLDER = 'flood_extent_vs_hydraulic_hazard_brazil'
+SCALE_M      = 1000
+TILE_SCALE   = 4
+GFD_YEAR_START = None
+GFD_YEAR_END   = None
+
+MACRO_REGIONS = {
+    'Amazon'     : ['AM','PA','RR','AP','AC','RO','TO'],
+    'Pantanal'   : ['MT','MS'],
+    'Northeast'  : ['MA','PI','CE','RN','PB','PE','AL','SE','BA'],
+    'Southeast'  : ['MG','ES','RJ','SP'],
+    'South'      : ['PR','SC','RS'],
+    'Central-West': ['GO','DF'],
+}
+
+NATURE_DPI = 500
+NATURE_W   = 7.087
+NATURE_H   = 6.693
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+OUT      = Path(f'/content/drive/MyDrive/{DRIVE_FOLDER}')
+OUT_CKPT = OUT / 'checkpoints'
+OUT_FIGS = OUT / 'figures'
+OUT_DATA = OUT / 'data'
+OUT_RAST = OUT / 'rasters'
+OUT_STAT = OUT / 'statistics'
+
+for d in [OUT, OUT_CKPT, OUT_FIGS, OUT_DATA, OUT_RAST, OUT_STAT]:
+    d.mkdir(parents=True, exist_ok=True)
+print(f'Output root: {OUT}')
+
+try:
+    ee.Initialize(project=EE_PROJECT)
+    print(f'EE initialized: {EE_PROJECT}')
+except ee.EEException:
+    ee.Authenticate()
+    ee.Initialize(project=EE_PROJECT)
+    print(f'EE authenticated: {EE_PROJECT}')
+
+
+# =============================================================================
+# BLOCK 2 — UTILITIES
+# =============================================================================
+
+console = Console()
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    datefmt='%H:%M:%S',
+    handlers=[logging.StreamHandler(),
+              logging.FileHandler(OUT / 'pipeline.log', mode='a')])
+log = logging.getLogger('flood_brazil')
+log.info('=' * 70)
+
+def log_step(msg, level='info'):
+    colors = {'info':'cyan','ok':'green','warn':'yellow','error':'red'}
+    rprint(f'[{colors.get(level,"white")}]{datetime.now():%H:%M:%S}[/] {msg}')
+    getattr(log, 'info' if level == 'ok' else level)(msg)
+
+def ckpt_path(name):        return OUT_CKPT / f'{name}.parquet'
+def ckpt_exists(name):      return ckpt_path(name).exists()
+def ckpt_json_exists(name): return (OUT_CKPT / f'{name}.json').exists()
+
+def ckpt_save(df, name):
+    df.to_parquet(ckpt_path(name), index=False)
+    log_step(f'Checkpoint saved: {name}.parquet ({len(df):,} rows)', 'ok')
+
+def ckpt_load(name):
+    df = pd.read_parquet(ckpt_path(name))
+    log_step(f'Checkpoint loaded: {name}.parquet ({len(df):,} rows)', 'ok')
+    return df
+
+def ckpt_save_json(obj, name):
+    (OUT_CKPT / f'{name}.json').write_text(json.dumps(obj, indent=2))
+    log_step(f'JSON saved: {name}.json', 'ok')
+
+def ckpt_load_json(name):
+    return json.loads((OUT_CKPT / f'{name}.json').read_text())
+
+def normalize_cdmun(series):
+    return series.astype(str).str.extract(r'(\d+)', expand=False).str.zfill(7)
+
+def ckpt_valid(name: str, required_cols: list, min_nonzero_col: str = None) -> bool:
+    """
+    Returns True only if the checkpoint parquet:
+      1. Exists
+      2. Contains all required_cols
+      3. If min_nonzero_col given: that column has at least 10% non-zero/non-null values
+    Deletes the checkpoint if invalid so next run recomputes it.
+    """
+    if not ckpt_exists(name):
+        return False
+    try:
+        df = pd.read_parquet(ckpt_path(name))
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            log_step(f'Checkpoint {name} missing columns {missing} — invalidating', 'warn')
+            ckpt_path(name).unlink()
+            return False
+        if min_nonzero_col and min_nonzero_col in df.columns:
+            col = df[min_nonzero_col]
+            valid_frac = col.notna().mean() if col.dtype == object else (col != 0).mean()
+            if valid_frac < 0.05:
+                log_step(f'Checkpoint {name}: {min_nonzero_col} is {valid_frac*100:.1f}% valid '
+                         f'(expected >5%) — invalidating stale checkpoint', 'warn')
+                ckpt_path(name).unlink()
+                # Also invalidate downstream checkpoints
+                for downstream in ['muni_stats_BR', 'statistical_results']:
+                    if ckpt_exists(downstream):
+                        ckpt_path(downstream).unlink()
+                        log_step(f'  Also invalidated downstream: {downstream}.parquet', 'warn')
+                    _j = OUT_CKPT / f'{downstream}.json'
+                    if _j.exists():
+                        _j.unlink()
+                        log_step(f'  Also invalidated downstream: {downstream}.json', 'warn')
+                return False
+        return True
+    except Exception as e:
+        log_step(f'Checkpoint {name} unreadable ({e}) — invalidating', 'warn')
+        ckpt_path(name).unlink()
+        return False
+
+@retry(retry=retry_if_exception_type((ee.EEException, Exception)),
+       stop=stop_after_attempt(6),
+       wait=wait_exponential(multiplier=2, min=5, max=90),
+       reraise=True)
+def ee_get(obj):
+    return obj.getInfo()
+
+def show_and_save(fig, name, dpi=NATURE_DPI):
+    for ext in ['pdf','png']:
+        fig.savefig(OUT_FIGS / f'{name}.{ext}', dpi=dpi,
+                    bbox_inches='tight', facecolor='white')
+    log_step(f'Figure saved: {name}.pdf + .png ({dpi} dpi)', 'ok')
+    IPydisplay.display(fig)
+    plt.close(fig)
+
+def rich_table(df, title, n=12):
+    t = Table(title=title, show_lines=True)
+    for col in df.columns[:8]:
+        t.add_column(str(col), style='cyan', max_width=22)
+    for _, row in df.head(n).iterrows():
+        t.add_row(*[str(round(v,3) if isinstance(v,float) else v)
+                    for v in row.values[:8]])
+    console.print(t)
+
+def gdf_to_ee_fc(gdf, keep_cols=('CD_MUN','NM_MUN','SIGLA_UF')):
+    features = []
+    gdf = gdf.to_crs('EPSG:4326').copy()
+    for _, row in gdf.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty: continue
+        props = {c: str(row[c]) for c in keep_cols if c in row.index}
+        gj   = json.loads(gpd.GeoSeries([geom], crs='EPSG:4326').to_json())
+        features.append(ee.Feature(
+            ee.Geometry(gj['features'][0]['geometry']), props))
+    return ee.FeatureCollection(features)
+
+log_step('Utilities loaded', 'ok')
+FORCE_CLEAN = False
+
+
+# =============================================================================
+# BLOCK 3 — BASE DATA
+# =============================================================================
+
+log_step('Loading Brazil geometry...')
+brazil = (ee.FeatureCollection('FAO/GAUL/2015/level0')
+            .filter(ee.Filter.eq('ADM0_NAME','Brazil')).geometry())
+log_step('Brazil OK', 'ok')
+
+log_step('Loading MERIT HAND...')
+hand_raw = ee.Image('MERIT/Hydro/v1_0_1').select('hnd').clip(brazil)
+hb = ee_get(ee.Image('MERIT/Hydro/v1_0_1').bandNames())
+assert 'hnd' in hb, f'Band hnd not found: {hb}'
+hand_class = (ee.Image(0)
+    .where(hand_raw.gt(0).And(hand_raw.lte(5)),  1)
+    .where(hand_raw.gt(5).And(hand_raw.lte(10)), 2)
+    .where(hand_raw.gt(10).And(hand_raw.lte(20)),3)
+    .where(hand_raw.gt(20), 4)
+    .updateMask(hand_raw.mask())
+    .rename('hand_class').clip(brazil).toInt8())
+log_step('HAND reclassified (4 classes)', 'ok')
+
+log_step('Loading GFD...')
+gfd_col = (ee.ImageCollection('GLOBAL_FLOOD_DB/MODIS_EVENTS/V1')
+             .filterBounds(brazil))
+if GFD_YEAR_START:
+    gfd_col = gfd_col.filter(
+        ee.Filter.calendarRange(GFD_YEAR_START, GFD_YEAR_END, 'year'))
+FLOOD_BAND = 'flooded'
+sb = ee_get(ee.Image(gfd_col.first()).bandNames())
+assert FLOOD_BAND in sb
+n_gfd = ee_get(gfd_col.size())
+log_step(f'GFD: {n_gfd} events', 'ok')
+
+jrc_perm = (ee.Image('JRC/GSW1_4/GlobalSurfaceWater')
+              .select('seasonality').gte(10).unmask(0))
+log_step('JRC OK', 'ok')
+
+IBGE_CKPT = 'municipios_ibge_2022'
+if ckpt_exists(IBGE_CKPT):
+    log_step('IBGE: loading from checkpoint...')
+    df_cache = pd.read_parquet(ckpt_path(IBGE_CKPT))
+    muni_gdf = gpd.GeoDataFrame(
+        df_cache,
+        geometry=gpd.GeoSeries.from_wkt(df_cache['geometry_wkt']),
+        crs='EPSG:4326').drop(columns=['geometry_wkt'])
+else:
+    log_step('Downloading IBGE 2022...')
+    shp = Path('/tmp/ibge_muni/BR_Municipios_2022.shp')
+    if not shp.exists():
+        url = ('https://geoftp.ibge.gov.br/organizacao_do_territorio/'
+               'malhas_territoriais/malhas_municipais/municipio_2022/'
+               'Brasil/BR/BR_Municipios_2022.zip')
+        r = requests.get(url, timeout=180); r.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+            z.extractall('/tmp/ibge_muni')
+    muni_gdf = gpd.read_file(str(shp)).to_crs('EPSG:4326')
+    dc = muni_gdf.copy()
+    dc['geometry_wkt'] = dc.geometry.to_wkt()
+    ckpt_save(dc.drop(columns=['geometry']), IBGE_CKPT)
+
+muni_gdf['CD_MUN']  = normalize_cdmun(muni_gdf['CD_MUN'])
+muni_gdf['SIGLA_UF'] = muni_gdf['SIGLA_UF'].astype(str)
+uf_to_macro = {uf: reg for reg, ufs in MACRO_REGIONS.items() for uf in ufs}
+muni_gdf['macro_region'] = muni_gdf['SIGLA_UF'].map(uf_to_macro).fillna('Other')
+ALL_UFS = sorted(muni_gdf['SIGLA_UF'].unique().tolist())
+assert len(muni_gdf) == muni_gdf['CD_MUN'].nunique()
+log_step(f'IBGE: {len(muni_gdf):,} municipalities', 'ok')
+log_step('Block 3 complete', 'ok')
+
+
+# =============================================================================
+# BLOCK 4 — FLOOD FREQUENCY STACK + REDUCER DEFINITIONS
+# =============================================================================
+
+log_step('Building flood frequency stack...')
+flood_freq = (gfd_col.select(FLOOD_BAND)
+    .map(lambda img: img.unmask(0)).sum()
+    .updateMask(jrc_perm.Not()).clip(brazil).rename('flood_freq'))
+flood_extent_max = flood_freq.gt(0).selfMask().rename('flood_extent')
+
+area_km2 = (ee_get(
+    flood_extent_max.multiply(ee.Image.pixelArea()).divide(1e6)
+    .reduceRegion(reducer=ee.Reducer.sum(), geometry=brazil,
+                  scale=2000, maxPixels=1e10, bestEffort=True))
+    .get('flood_extent',0) or 0)
+log_step(f'Total flooded area (2km): {area_km2:,.0f} km2 '
+         f'({area_km2/8_516_000*100:.2f}% of Brazil)', 'ok')
+
+# Image 1: flood metrics — masked to flooded pixels
+hand_flooded = hand_raw.updateMask(flood_extent_max).rename('hand_m')
+img_flood = (flood_extent_max
+    .multiply(ee.Image.pixelArea().divide(1e6)).rename('flood_area_km2')
+    .addBands(flood_freq.updateMask(flood_extent_max).rename('flood_freq'))
+    .addBands(hand_flooded))
+
+# Image 2: HAND class — ALL pixels (not flood-masked)
+# Used for frac_high_hazard = structural hazard of the full municipality
+img_hand_all = hand_class.rename('hand_class')
+
+# Reducers
+reducer_flood = (
+    ee.Reducer.sum().setOutputs(['flood_area_km2'])
+    .combine(ee.Reducer.mean().setOutputs(['flood_freq_mean']), sharedInputs=False)
+    .combine(ee.Reducer.percentile([25,50,75,90,95],
+             outputNames=['hand_p25','hand_p50','hand_p75','hand_p90','hand_p95']),
+             sharedInputs=False))
+
+reducer_hand_hist = ee.Reducer.frequencyHistogram()  # GEE names output 'histogram' in reduceRegions
+
+log_step('Block 4 complete', 'ok')
+
+
+# =============================================================================
+# BLOCK 5 — PER-UF GEE EXPORTS (TWO TASKS PER UF)
+# =============================================================================
+
+STATS_CKPT = 'muni_stats_gee'
+DRIVE_ROOT = Path('/content/drive/MyDrive')
+
+def _find_csvs(pattern):
+    found = []
+    for d in [OUT, OUT_DATA, DRIVE_ROOT / DRIVE_FOLDER]:
+        if d.exists():
+            found += list(d.glob(pattern))
+    return list({f.name: f for f in found}.values())
+
+if ckpt_valid(STATS_CKPT,
+              required_cols=['CD_MUN','flood_area_km2','frac_high_hazard'],
+              min_nonzero_col='frac_high_hazard'):
+    log_step('Municipal stats: loading checkpoint...')
+    stats_df = ckpt_load(STATS_CKPT)
+
+else:
+    # Detect which UFs already have BOTH CSVs
+    _done_ufs = set()
+    for uf in ALL_UFS:
+        if (_find_csvs(f'muni_stats_IBGE_{uf}_{SCALE_M}m.csv') and
+                _find_csvs(f'muni_hand_IBGE_{uf}_{SCALE_M}m.csv')):
+            _done_ufs.add(uf)
+    log_step(f'UFs with existing CSVs: {sorted(_done_ufs)}', 'ok')
+
+    tasks = {}
+    for uf in ALL_UFS:
+        if uf in _done_ufs:
+            log_step(f'{uf}: CSVs exist, skipping', 'ok')
+            continue
+
+        uf_gdf   = muni_gdf.loc[muni_gdf['SIGLA_UF'] == uf,
+                                 ['CD_MUN','NM_MUN','SIGLA_UF','geometry']].copy()
+        uf_simpl = uf_gdf.to_crs('EPSG:6933')
+        uf_simpl['geometry'] = uf_simpl.geometry.simplify(250, preserve_topology=True)
+        uf_simpl = uf_simpl.to_crs('EPSG:4326')
+        fc = gdf_to_ee_fc(uf_simpl)
+
+        # Task 1: flood metrics only — no HAND join
+        desc_flood = f'muni_stats_IBGE_{uf}_{SCALE_M}m'
+        fc_flood_only = img_flood.reduceRegions(
+            collection=fc, reducer=reducer_flood,
+            scale=SCALE_M, tileScale=TILE_SCALE)
+        t_flood = ee.batch.Export.table.toDrive(
+            collection=fc_flood_only,
+            description=desc_flood, folder=DRIVE_FOLDER,
+            fileNamePrefix=desc_flood, fileFormat='CSV')
+        t_flood.start()
+
+        # Task 2: HAND class histogram over ALL municipal pixels (no flood mask)
+        desc_hand = f'muni_hand_IBGE_{uf}_{SCALE_M}m'
+        fc_hand_only = img_hand_all.reduceRegions(
+            collection=fc, reducer=reducer_hand_hist,
+            scale=SCALE_M, tileScale=TILE_SCALE)
+        t_hand = ee.batch.Export.table.toDrive(
+            collection=fc_hand_only,
+            description=desc_hand, folder=DRIVE_FOLDER,
+            fileNamePrefix=desc_hand, fileFormat='CSV')
+        t_hand.start()
+
+        tasks[uf] = (t_flood, t_hand)
+        log_step(f'{uf}: tasks started [{t_flood.id}] [{t_hand.id}]', 'ok')
+
+    if tasks:
+        log_step(f'Monitoring {len(tasks)*2} GEE tasks ({len(tasks)} UFs)...')
+        pbar = tqdm_nb(total=len(ALL_UFS), initial=len(_done_ufs),
+                       desc='UF exports', unit='UF')
+        done_set = set(_done_ufs)
+        while len(done_set) < len(ALL_UFS):
+            for uf, (t1, t2) in list(tasks.items()):
+                if uf in done_set: continue
+                s1 = t1.status().get('state','UNKNOWN')
+                s2 = t2.status().get('state','UNKNOWN')
+                if s1 == 'COMPLETED' and s2 == 'COMPLETED':
+                    done_set.add(uf)
+                    pbar.update(1)
+                    pbar.set_postfix({'last': uf})
+                    log_step(f'{uf}: both tasks completed', 'ok')
+                elif s1 in ('FAILED','CANCELLED'):
+                    raise RuntimeError(f'{uf} flood: {t1.status().get("error_message","?")}')
+                elif s2 in ('FAILED','CANCELLED'):
+                    raise RuntimeError(f'{uf} hand: {t2.status().get("error_message","?")}')
+            time.sleep(30)
+        pbar.close()
+        log_step('All UF tasks completed', 'ok')
+
+    # Wait for Drive sync
+    log_step('Waiting for Drive CSV sync...')
+    t0 = time.time()
+    while True:
+        _fc = _find_csvs(f'muni_stats_IBGE_*_{SCALE_M}m.csv')
+        _hc = _find_csvs(f'muni_hand_IBGE_*_{SCALE_M}m.csv')
+        if len(_fc) >= len(ALL_UFS) and len(_hc) >= len(ALL_UFS):
+            break
+        elapsed = time.time() - t0
+        if elapsed > 600:
+            log_step(f'flood={len(_fc)} hand={len(_hc)}/{len(ALL_UFS)} after '
+                     f'{elapsed/60:.0f} min. Continuing.', 'warn')
+            break
+        log_step(f'  Syncing... flood={len(_fc)} hand={len(_hc)}/{len(ALL_UFS)}',
+                 'info')
+        time.sleep(15)
+
+    flood_csvs = _find_csvs(f'muni_stats_IBGE_*_{SCALE_M}m.csv')
+    hand_csvs  = _find_csvs(f'muni_hand_IBGE_*_{SCALE_M}m.csv')
+    if not flood_csvs:
+        raise FileNotFoundError('No flood CSVs. Check Drive + GEE tasks.')
+    if not hand_csvs:
+        raise FileNotFoundError('No HAND CSVs. Check Drive + GEE tasks.')
+    log_step(f'Found {len(flood_csvs)} flood + {len(hand_csvs)} HAND CSVs', 'ok')
+
+    # Parse flood CSVs
+    flood_frames = []
+    for csv in sorted(flood_csvs):
+        df = pd.read_csv(csv)
+        if df.empty or 'CD_MUN' not in df.columns: continue
+        df['CD_MUN'] = normalize_cdmun(df['CD_MUN'])
+        ren = {}
+        for c in df.columns:
+            cl = c.lower()
+            if 'p25' in cl and 'hand' in cl: ren[c] = 'hand_p25_m'
+            if 'p50' in cl and 'hand' in cl: ren[c] = 'hand_p50_m'
+            if 'p75' in cl and 'hand' in cl: ren[c] = 'hand_p75_m'
+            if 'p90' in cl and 'hand' in cl: ren[c] = 'hand_p90_m'
+            if 'p95' in cl and 'hand' in cl: ren[c] = 'hand_p95_m'
+            if 'freq_mean' in cl:            ren[c] = 'flood_freq_mean'
+        df = df.rename(columns=ren).drop(
+            columns=['.geo','system:index'], errors='ignore')
+        flood_frames.append(df)
+    flood_df = pd.concat(flood_frames, ignore_index=True)
+    flood_df['CD_MUN'] = normalize_cdmun(flood_df['CD_MUN'])
+
+    # Parse HAND histogram CSVs
+    hand_frames = []
+    for csv in sorted(hand_csvs):
+        df = pd.read_csv(csv)
+        if df.empty or 'CD_MUN' not in df.columns: continue
+        df['CD_MUN'] = normalize_cdmun(df['CD_MUN'])
+        # GEE names the frequencyHistogram output 'histogram'
+        hist_col = next((c for c in df.columns
+                         if c.lower() == 'histogram' or c.lower() == 'hand_class_histogram'), None)
+        if hist_col is None:
+            # fallback: any column with 'hist'
+            hist_col = next((c for c in df.columns if 'hist' in c.lower()), None)
+        if hist_col is None:
+            log_step('No histogram column in ' + str(csv.name) + '. Cols: ' + str(df.columns.tolist()), 'warn')
+            continue
+
+        def _ph(v):
+            """Parse GEE histogram string.
+            Handles both JSON format  {"1":123}
+            and Python dict format    {1=123, 2=456}
+            """
+            s = str(v).strip()
+            try:
+                # Standard JSON: {"1": 123}
+                h = json.loads(s.replace("'", '"'))
+            except Exception:
+                try:
+                    s2 = s.strip('{}')
+                    h = {}
+                    for part in s2.split(','):
+                        part = part.strip()
+                        if '=' in part:
+                            k, val = part.split('=', 1)
+                            h[k.strip()] = float(val.strip())
+                except Exception:
+                    h = {}
+            return (int(h.get('1', h.get(1, 0))),
+                    int(h.get('2', h.get(2, 0))),
+                    int(h.get('3', h.get(3, 0))),
+                    int(h.get('4', h.get(4, 0))))
+
+        hp = df[hist_col].apply(_ph)
+        df[['hand_1_px','hand_2_px','hand_3_px','hand_4_px']] = (
+            pd.DataFrame(hp.tolist(), index=df.index))
+        df['hand_total_px']    = df[['hand_1_px','hand_2_px',
+                                      'hand_3_px','hand_4_px']].sum(axis=1)
+        df['hand_dom_class']   = (df[['hand_1_px','hand_2_px',
+                                       'hand_3_px','hand_4_px']]
+                                  .idxmax(axis=1).str.extract(r'(\d)').squeeze())
+        df['frac_high_hazard'] = (
+            (df['hand_1_px'] + df['hand_2_px']) /
+            df['hand_total_px'].clip(lower=1)).round(4)
+        hand_frames.append(df[['CD_MUN','hand_1_px','hand_2_px','hand_3_px',
+                                'hand_4_px','hand_total_px','hand_dom_class',
+                                'frac_high_hazard']].copy())
+
+    hand_df = pd.concat(hand_frames, ignore_index=True)
+    hand_df['CD_MUN'] = normalize_cdmun(hand_df['CD_MUN'])
+    hand_df = hand_df.drop_duplicates('CD_MUN')
+
+    # Join flood + HAND on CD_MUN
+    stats_df = flood_df.merge(hand_df, on='CD_MUN', how='left')
+    if 'hand_p95_m' in stats_df.columns:
+        stats_df['vol_proxy_km2m'] = (
+            stats_df['flood_area_km2'] *
+            stats_df['hand_p95_m'].fillna(0)).round(4)
+    else:
+        stats_df['vol_proxy_km2m'] = 0.0
+
+    log_step(f'Rows before dedup: {len(stats_df):,}')
+    stats_df = stats_df.dropna(subset=['CD_MUN']).copy()
+    stats_df['CD_MUN'] = normalize_cdmun(stats_df['CD_MUN'])
+    if stats_df['CD_MUN'].duplicated().any():
+        sc = 'flood_area_km2' if 'flood_area_km2' in stats_df.columns else 'CD_MUN'
+        stats_df = (stats_df.sort_values(sc, ascending=False)
+                            .drop_duplicates('CD_MUN', keep='first')
+                            .sort_values('CD_MUN').reset_index(drop=True))
+    ckpt_save(stats_df, STATS_CKPT)
+    log_step(f'Block 5 complete: {len(stats_df):,} municipalities', 'ok')
+
+rich_table(stats_df, 'Municipal GEE statistics sample')
+
+
+# =============================================================================
+# BLOCK 6 — EDHI + CLASSIFICATION MATRIX
+# =============================================================================
+
+MUNI_CKPT = 'muni_stats_BR'
+if ckpt_valid(MUNI_CKPT,
+              required_cols=['CD_MUN','EDHI','frac_high_hazard','flood_frac'],
+              min_nonzero_col='frac_high_hazard'):
+    log_step('EDHI stats: loading checkpoint...')
+    muni_stats_df = ckpt_load(MUNI_CKPT)
+else:
+    log_step('Computing EDHI...')
+    agg = stats_df.copy()
+    agg['CD_MUN'] = normalize_cdmun(agg['CD_MUN'])
+
+    meta = muni_gdf[['CD_MUN','NM_MUN','SIGLA_UF','macro_region']].copy()
+    meta['CD_MUN'] = normalize_cdmun(meta['CD_MUN'])
+    assert len(agg) == agg['CD_MUN'].nunique()
+    agg = agg.merge(meta, on='CD_MUN', how='left', validate='1:1')
+
+    area = muni_gdf[['CD_MUN','geometry']].copy().to_crs('EPSG:6933')
+    area['CD_MUN'] = normalize_cdmun(area['CD_MUN'])
+    area['muni_area_km2'] = area.geometry.area / 1e6
+    area = area[['CD_MUN','muni_area_km2']].drop_duplicates('CD_MUN')
+    agg  = agg.merge(area, on='CD_MUN', how='left', validate='1:1')
+
+    if 'flood_area_km2' in agg.columns and 'flood_area_km2_sum' not in agg.columns:
+        agg = agg.rename(columns={'flood_area_km2': 'flood_area_km2_sum'})
+
+    agg['flood_area_km2_sum'] = agg['flood_area_km2_sum'].fillna(0)
+    agg['flood_frac']         = (agg['flood_area_km2_sum'] /
+                                  agg['muni_area_km2'].clip(lower=0.01)).clip(upper=1).round(4)
+    agg['frac_high_hazard']   = ((agg['hand_1_px'] + agg['hand_2_px']) /
+                                   agg['hand_total_px'].clip(lower=1)).round(4)
+    agg['hand_dom_class']     = (agg[['hand_1_px','hand_2_px','hand_3_px','hand_4_px']]
+                                  .idxmax(axis=1).str.extract(r'(\d)').squeeze())
+    agg['EDHI'] = (agg['flood_frac'] - agg['frac_high_hazard']).round(4)
+
+    flooded  = agg[agg['flood_area_km2_sum'] > 0].copy()
+    ext_med  = flooded['flood_frac'].median()
+    haz_med  = flooded['frac_high_hazard'].median()
+    flooded['ext_class']   = np.where(flooded['flood_frac'] >= ext_med, 'H','L')
+    flooded['haz_class']   = np.where(flooded['frac_high_hazard'] >= haz_med,'H','L')
+    flooded['matrix_cell'] = np.select([
+        (flooded['ext_class']=='H') & (flooded['haz_class']=='H'),
+        (flooded['ext_class']=='H') & (flooded['haz_class']=='L'),
+        (flooded['ext_class']=='L') & (flooded['haz_class']=='H'),
+        (flooded['ext_class']=='L') & (flooded['haz_class']=='L')],
+        ['TP','FP','FN','TN'], default='NA')
+    agg = agg.merge(flooded[['CD_MUN','ext_class','haz_class','matrix_cell']],
+                    on='CD_MUN', how='left', validate='1:1')
+
+    for c in ['flood_area_km2_sum','flood_freq_mean','hand_p50_m','hand_p90_m',
+              'hand_p95_m','vol_proxy_km2m','flood_frac','frac_high_hazard','EDHI']:
+        if c in agg.columns:
+            agg[c] = pd.to_numeric(agg[c], errors='coerce').round(4)
+
+    muni_stats_df = agg
+    ckpt_save(muni_stats_df, MUNI_CKPT)
+
+# Ensure suffix columns are cleaned
+muni_gdf['CD_MUN']      = normalize_cdmun(muni_gdf['CD_MUN'])
+muni_stats_df['CD_MUN'] = normalize_cdmun(muni_stats_df['CD_MUN'])
+muni_stats_df           = muni_stats_df.drop_duplicates('CD_MUN')
+muni_stats = muni_gdf.merge(muni_stats_df, on='CD_MUN', how='left',
+                             validate='1:1', suffixes=('','_stat'))
+for col in ['NM_MUN_stat','SIGLA_UF_stat','macro_region_stat']:
+    if col in muni_stats.columns:
+        muni_stats = muni_stats.drop(columns=[col])
+# Ensure SIGLA_UF and NM_MUN are not suffixed in muni_stats_df
+for src, dst in [('SIGLA_UF_x','SIGLA_UF'),('NM_MUN_x','NM_MUN'),
+                  ('macro_region_x','macro_region')]:
+    if src in muni_stats_df.columns and dst not in muni_stats_df.columns:
+        muni_stats_df = muni_stats_df.rename(columns={src: dst})
+
+log_step(f'Block 6 complete: {len(muni_stats_df):,} municipalities', 'ok')
+rich_table(muni_stats_df[muni_stats_df['flood_area_km2_sum'] > 0]
+           .sort_values('EDHI', ascending=False).head(15),
+           'Top positive EDHI municipalities')
+
+
+# =============================================================================
+# BLOCK 7 — STATISTICAL ANALYSIS
+# =============================================================================
+
+STAT_CKPT = 'statistical_results'
+# Validate stats checkpoint: rho must be a real number, not NaN
+_stat_ok = False
+if ckpt_json_exists(STAT_CKPT):
+    try:
+        _sr_check = ckpt_load_json(STAT_CKPT)
+        _rho_check = _sr_check.get('spearman_national',{}).get('rho', float('nan'))
+        import math
+        if not math.isnan(float(_rho_check if _rho_check is not None else float('nan'))):
+            _stat_ok = True
+        else:
+            log_step('Statistical checkpoint has NaN rho — recomputing', 'warn')
+            (OUT_CKPT / f'{STAT_CKPT}.json').unlink()
+    except Exception:
+        pass
+if _stat_ok:
+    log_step('Statistical results: loading checkpoint...')
+    stat_results = ckpt_load_json(STAT_CKPT)
+    # Remap Portuguese region keys to English (backward compatibility)
+    _pt_to_en = {'Amazonia':'Amazon','Nordeste':'Northeast','Sudeste':'Southeast',
+                 'Sul':'South','CentroOeste':'Central-West'}
+    if 'spearman_by_region' in stat_results:
+        _reg_old = stat_results['spearman_by_region']
+        stat_results['spearman_by_region'] = {
+            _pt_to_en.get(k, k): v for k, v in _reg_old.items()}
+else:
+    stat_results = {}
+    _df = (muni_stats_df[muni_stats_df['flood_area_km2_sum'] > 0]
+           .copy().dropna(subset=['flood_frac','frac_high_hazard','EDHI','SIGLA_UF']))
+
+    # Spearman
+    log_step('Computing Spearman correlations...')
+    rho_nat, pval_nat = stats.spearmanr(_df['flood_frac'], _df['frac_high_hazard'])
+    stat_results['spearman_national'] = {
+        'rho': round(float(rho_nat),4), 'pval': float(pval_nat), 'n': int(len(_df))}
+    rho_by_region = {}
+    for region, ufs in MACRO_REGIONS.items():
+        sub = _df[_df['SIGLA_UF'].isin(ufs)]
+        if len(sub) < 10: continue
+        r, p = stats.spearmanr(sub['flood_frac'], sub['frac_high_hazard'])
+        rho_by_region[region] = {'rho':round(float(r),4),'pval':float(p),'n':int(len(sub))}
+    stat_results['spearman_by_region'] = rho_by_region
+    log_step(f'Spearman: rho={rho_nat:.3f}  p={pval_nat:.2e}  n={len(_df):,}', 'ok')
+
+    # Spatial Lag Model + Moran's I
+    log_step('Spatial statistics...')
+    try:
+        geo    = (muni_stats[muni_stats['CD_MUN'].isin(_df['CD_MUN'])]
+                  .copy().dropna(subset=['geometry']).to_crs('EPSG:6933')
+                  .drop_duplicates('CD_MUN').sort_values('CD_MUN'))
+        df_slm = (_df.drop_duplicates('CD_MUN').sort_values('CD_MUN')
+                     [_df['CD_MUN'].isin(geo['CD_MUN'])].reset_index(drop=True))
+        geo    = geo[geo['CD_MUN'].isin(df_slm['CD_MUN'])].reset_index(drop=True)
+        assert list(df_slm['CD_MUN']) == list(geo['CD_MUN'])
+        W = KNN.from_dataframe(geo, k=5); W.transform = 'R'
+        y = df_slm['EDHI'].values.reshape(-1,1)
+        hcol = 'hand_p50_m' if 'hand_p50_m' in df_slm.columns else 'hand_p50'
+        X = df_slm[['flood_frac', hcol]].fillna(0).values
+        slm = ML_Lag(y, X, W, name_y='EDHI',
+                     name_x=['flood_frac', hcol], name_ds='Brazil municipalities')
+        stat_results['spatial_lag_model'] = {
+            'rho_spatial': round(float(slm.rho),4),
+            'rho_pval'   : float(slm.z_stat[-1][1]),
+            'pseudo_r2'  : round(float(slm.pr2),4),
+            'AIC'        : round(float(slm.aic),2),
+            'n'          : int(slm.n)}
+        log_step(f'SLM: rho={slm.rho:.3f}  pseudo-R2={slm.pr2:.3f}', 'ok')
+        mi = Moran(df_slm['EDHI'].values, W)
+        stat_results['morans_I'] = {
+            'I':round(float(mi.I),4),'pval':float(mi.p_sim),'z':round(float(mi.z_sim),3)}
+        log_step(f"Moran's I: {mi.I:.4f}  p={mi.p_sim:.4f}", 'ok')
+    except Exception as e:
+        log_step(f'Spatial stats failed: {e}', 'warn')
+        stat_results['spatial_lag_model'] = {'error': str(e)}
+        stat_results['morans_I']           = {'error': str(e)}
+
+    # 2x2 matrix
+    mat   = _df['matrix_cell'].value_counts()
+    tp,fp,fn,tn = (int(mat.get('TP',0)), int(mat.get('FP',0)),
+                   int(mat.get('FN',0)), int(mat.get('TN',0)))
+    total = tp+fp+fn+tn
+    fpr   = fp/max(fp+tn,1); fnr = fn/max(fn+tp,1)
+    mcc   = (tp*tn-fp*fn)/max(math.sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn)),1)
+    stat_results['classification_matrix'] = {
+        'TP':tp,'FP':fp,'FN':fn,'TN':tn,'total':total,
+        'false_positive_rate':round(fpr,4),'false_negative_rate':round(fnr,4),
+        'MCC':round(mcc,4)}
+    log_step(f'2x2: FPR={fpr*100:.1f}%  FNR={fnr*100:.1f}%  MCC={mcc:.3f}', 'ok')
+
+    ckpt_save_json(stat_results, STAT_CKPT)
+    log_step('Block 7 complete', 'ok')
+
+
+print('\n=== STATISTICAL RESULTS ===')
+print(json.dumps(stat_results, indent=2))
+
+
+# =============================================================================
+# BLOCK 7b -- EDHI DESCRIPTIVE STATISTICS + STATE-LEVEL TABLE
+# =============================================================================
+#
+# Produces:
+#   1. National EDHI summary statistics
+#   2. State-level table: median EDHI, % positive, % negative,
+#      dominant direction, n flooded municipalities
+#   3. Top 5 states with most negative EDHI (hazard underestimated)
+#   4. Top 5 states with most positive EDHI (hazard overestimated)
+#   5. Saves full table as CSV for supplementary material
+# =============================================================================
+
+log_step('Computing EDHI descriptive statistics...')
+
+# Work with flooded municipalities only
+_edhi_all  = muni_stats_df.dropna(subset=['EDHI', 'SIGLA_UF']).copy()
+_edhi_fl   = _edhi_all[_edhi_all['flood_area_km2_sum'] > 0].copy()
+
+# UF full names
+_uf_names = {
+    'AC':'Acre','AL':'Alagoas','AM':'Amazonas','AP':'Amapa',
+    'BA':'Bahia','CE':'Ceara','DF':'Distrito Federal','ES':'Espirito Santo',
+    'GO':'Goias','MA':'Maranhao','MG':'Minas Gerais','MS':'Mato Grosso do Sul',
+    'MT':'Mato Grosso','PA':'Para','PB':'Paraiba','PE':'Pernambuco',
+    'PI':'Piaui','PR':'Parana','RJ':'Rio de Janeiro','RN':'Rio Grande do Norte',
+    'RO':'Rondonia','RR':'Roraima','RS':'Rio Grande do Sul',
+    'SC':'Santa Catarina','SE':'Sergipe','SP':'Sao Paulo','TO':'Tocantins'}
+
+# --- 1. National EDHI summary ---
+_n_total   = len(_edhi_all)
+_n_flooded = len(_edhi_fl)
+_n_pos     = ((_edhi_fl['EDHI'] >  0.05).sum())
+_n_neg     = ((_edhi_fl['EDHI'] < -0.05).sum())
+_n_neut    = _n_flooded - _n_pos - _n_neg
+_pct_pos   = _n_pos   / _n_flooded * 100
+_pct_neg   = _n_neg   / _n_flooded * 100
+_pct_neut  = _n_neut  / _n_flooded * 100
+
+print('\n' + '='*72)
+print('EDHI NATIONAL SUMMARY  (flooded municipalities only, n={:,})'.format(_n_flooded))
+print('='*72)
+print('  EDHI > +0.05  (extent overestimates hazard) : {:,} municipalities ({:.1f}%)'.format(_n_pos, _pct_pos))
+print('  EDHI < -0.05  (extent underestimates hazard): {:,} municipalities ({:.1f}%)'.format(_n_neg, _pct_neg))
+print('  |EDHI| <= 0.05 (rough agreement)            : {:,} municipalities ({:.1f}%)'.format(_n_neut, _pct_neut))
+print()
+print('  National median EDHI : {:.4f}'.format(_edhi_fl['EDHI'].median()))
+print('  National mean EDHI   : {:.4f}'.format(_edhi_fl['EDHI'].mean()))
+print('  National std  EDHI   : {:.4f}'.format(_edhi_fl['EDHI'].std()))
+print('  National IQR  EDHI   : {:.4f} to {:.4f}'.format(
+    _edhi_fl['EDHI'].quantile(0.25), _edhi_fl['EDHI'].quantile(0.75)))
+print('  National 5th  pctile : {:.4f}'.format(_edhi_fl['EDHI'].quantile(0.05)))
+print('  National 95th pctile : {:.4f}'.format(_edhi_fl['EDHI'].quantile(0.95)))
+print('='*72)
+
+# --- 2. State-level table ---
+_state_rows = []
+for uf in sorted(_edhi_fl['SIGLA_UF'].unique()):
+    _sub = _edhi_fl[_edhi_fl['SIGLA_UF'] == uf]
+    _n   = len(_sub)
+    if _n == 0:
+        continue
+    _med  = _sub['EDHI'].median()
+    _mean = _sub['EDHI'].mean()
+    _ppos = (_sub['EDHI'] >  0.05).sum() / _n * 100
+    _pneg = (_sub['EDHI'] < -0.05).sum() / _n * 100
+    _pneu = 100 - _ppos - _pneg
+    _macro = _sub['macro_region'].mode()[0] if 'macro_region' in _sub.columns else ''
+    _direction = 'overestimates' if _med > 0.05 else ('underestimates' if _med < -0.05 else 'neutral')
+    _state_rows.append({
+        'State (UF)': '{} ({})'.format(_uf_names.get(uf, uf), uf),
+        'Region': _macro,
+        'n flooded': _n,
+        'Median EDHI': round(_med, 3),
+        'Mean EDHI': round(_mean, 3),
+        '% EDHI>0.05': round(_ppos, 1),
+        '% EDHI<-0.05': round(_pneg, 1),
+        '% neutral': round(_pneu, 1),
+        'Dominant direction': _direction,
+    })
+
+_state_df = pd.DataFrame(_state_rows).sort_values('Median EDHI', ascending=False)
+
+print('\n' + '='*72)
+print('EDHI BY STATE — sorted by median EDHI (most positive to most negative)')
+print('='*72)
+_cols_display = ['State (UF)', 'n flooded', 'Median EDHI',
+                 '% EDHI>0.05', '% EDHI<-0.05', 'Dominant direction']
+print(_state_df[_cols_display].to_string(index=False))
+print('='*72)
+
+# Rich table for notebook display
+_rt = Table(title='EDHI by State (flooded municipalities, sorted by median EDHI)',
+            show_lines=True)
+for col in _cols_display:
+    _rt.add_column(col, style='cyan' if 'EDHI' in col else 'white',
+                   max_width=28, justify='right' if 'n ' in col or '%' in col or 'EDHI' in col else 'left')
+for _, row in _state_df[_cols_display].iterrows():
+    _color = 'red' if row['Dominant direction'] == 'underestimates' else (
+             'blue' if row['Dominant direction'] == 'overestimates' else 'white')
+    _rt.add_row(*[str(v) for v in row.values])
+console.print(_rt)
+
+# --- 3. Extremes ---
+_top5_pos = _state_df.head(5)
+_top5_neg = _state_df.tail(5).iloc[::-1]
+
+print('\n' + '='*72)
+print('TOP 5 STATES — EXTENT MOST OVERESTIMATES HAZARD (highest positive EDHI)')
+print('Interpretation: large flooded area but terrain is relatively safe')
+print('='*72)
+for _, r in _top5_pos.iterrows():
+    print('  {:35s}  median EDHI = {:+.3f}  ({:.0f}% of flooded muni have EDHI>0.05)'.format(
+        r['State (UF)'], r['Median EDHI'], r['% EDHI>0.05']))
+
+print('\n' + '='*72)
+print('TOP 5 STATES — EXTENT MOST UNDERESTIMATES HAZARD (most negative EDHI)')
+print('Interpretation: small flooded area but terrain is hydraulically intense')
+print('='*72)
+for _, r in _top5_neg.iterrows():
+    print('  {:35s}  median EDHI = {:+.3f}  ({:.0f}% of flooded muni have EDHI<-0.05)'.format(
+        r['State (UF)'], r['Median EDHI'], r['% EDHI<-0.05']))
+
+# --- 4. Save table as CSV ---
+_csv_path = OUT_STAT / 'EDHI_by_state.csv'
+_state_df.to_csv(_csv_path, index=False, encoding='utf-8-sig')
+log_step('EDHI state table saved: {}'.format(_csv_path.name), 'ok')
+
+# --- 5. Municipality extremes ---
+print('\n' + '='*72)
+print('TOP 10 MUNICIPALITIES — HIGHEST POSITIVE EDHI')
+print('(extent most overestimates hazard — large area, low HAND)')
+print('='*72)
+_top_muni_pos = (_edhi_fl[['NM_MUN', 'SIGLA_UF', 'macro_region',
+                             'flood_area_km2_sum', 'hand_p50_m',
+                             'frac_high_hazard', 'EDHI']]
+                 .sort_values('EDHI', ascending=False).head(10))
+print(_top_muni_pos.to_string(index=False))
+
+print('\n' + '='*72)
+print('TOP 10 MUNICIPALITIES — MOST NEGATIVE EDHI')
+print('(extent most underestimates hazard — small area, high HAND)')
+print('='*72)
+_top_muni_neg = (_edhi_fl[['NM_MUN', 'SIGLA_UF', 'macro_region',
+                             'flood_area_km2_sum', 'hand_p50_m',
+                             'frac_high_hazard', 'EDHI']]
+                 .sort_values('EDHI', ascending=True).head(10))
+print(_top_muni_neg.to_string(index=False))
+
+log_step('Block 7b complete', 'ok')
+
+
+
+
+
+
+# =============================================================================
+# BLOCK 8 -- SINGLE COMPOSITE FIGURE (NATURE COMMENT, 500 DPI)
+# =============================================================================
+#
+# Four panels aligned to the manuscript argument:
+#   (a) EDHI choropleth map
+#   (b) Scatter: flood extent vs HAND median (log-scale Y, clipped outliers)
+#   (c) Boxplot: HAND median by flood extent quartile
+#   (d) Spearman rho by macro-region (horizontal bars)
+# =============================================================================
+
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
+    'font.size': 7, 'axes.linewidth': 0.7,
+    'axes.labelsize': 7, 'axes.titlesize': 7.5,
+    'xtick.labelsize': 6.5, 'ytick.labelsize': 6.5,
+    'xtick.major.width': 0.6, 'ytick.major.width': 0.6,
+    'xtick.major.size': 3, 'ytick.major.size': 3,
+    'legend.fontsize': 6, 'legend.framealpha': 0.9,
+    'legend.edgecolor': '#cccccc', 'figure.dpi': 150,
+    'axes.spines.top': False, 'axes.spines.right': False,
+    'pdf.fonttype': 42, 'ps.fonttype': 42})
+
+PROJ      = ccrs.PlateCarree()
+EXTENT_BR = [-74, -28, -34, 6]
+
+REGION_COLORS = {
+    'Amazon': '#0072B2', 'Pantanal': '#009E73', 'Northeast': '#E69F00',
+    'Southeast': '#CC79A7', 'South': '#D55E00', 'Central-West': '#56B4E9',
+    'Other': '#999999'}
+
+EDHI_CMAP = mcolors.LinearSegmentedColormap.from_list('edhi',
+    ['#2166ac', '#4393c3', '#92c5de', '#d1e5f0', '#f7f7f7',
+     '#fddbc7', '#f4a582', '#d6604d', '#b2182b'], N=512)
+
+
+def base_map(ax, extent=EXTENT_BR):
+    ax.set_extent(extent, crs=PROJ)
+    ax.add_feature(cfeature.OCEAN, facecolor='#d6e8f5', zorder=0, alpha=0.7)
+    ax.add_feature(cfeature.LAKES, facecolor='#d6e8f5', zorder=0, alpha=0.5)
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.4, edgecolor='#444')
+    ax.add_feature(cfeature.BORDERS, linewidth=0.25, edgecolor='#666',
+                   linestyle=':')
+    gl = ax.gridlines(draw_labels=True, linewidth=0.15,
+                      color='#888', alpha=0.4, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.xlabel_style = {'size': 6, 'color': '#555'}
+    gl.ylabel_style = {'size': 6, 'color': '#555'}
+    return ax
+
+
+def panel_label(ax, label, x=0.015, y=0.975, fs=9):
+    ax.text(x, y, label, transform=ax.transAxes, fontsize=fs,
+            fontweight='bold', va='top', ha='left', color='#111')
+
+
+# --- Prepare data ---
+log_step('Preparing figure data...')
+
+df_fig = (muni_stats_df[muni_stats_df['flood_area_km2_sum'] > 0]
+          .copy()
+          .dropna(subset=['EDHI', 'flood_frac', 'frac_high_hazard',
+                          'macro_region', 'hand_p50_m']))
+
+sp  = stat_results.get('spearman_national', {})
+reg = stat_results.get('spearman_by_region', {})
+rho_nat  = sp.get('rho', float('nan'))
+pval_nat = sp.get('pval', 1.0)
+n_nat    = sp.get('n', 0)
+
+elim = float(max(abs(df_fig['EDHI'].quantile(0.02)),
+                 abs(df_fig['EDHI'].quantile(0.98))))
+if elim == 0 or not np.isfinite(elim):
+    elim = 1.0
+enorm = mcolors.TwoSlopeNorm(vmin=-elim, vcenter=0.0, vmax=elim)
+
+# Clip HAND to 99th percentile to remove outliers that distort axes
+hand_p99 = df_fig['hand_p50_m'].quantile(0.99)
+df_fig_clipped = df_fig[df_fig['hand_p50_m'] <= hand_p99].copy()
+
+# Quartile labels
+qlabels = ['Q1\n(lowest)', 'Q2', 'Q3', 'Q4\n(highest)']
+df_fig['extent_quartile'] = pd.qcut(
+    df_fig['flood_frac'], q=4, labels=qlabels)
+
+# --- Build figure ---
+log_step('Building composite figure (2x2 panels)...')
+
+# Layout: left col wider (map + boxplot), right col (scatter + spearman)
+fig = plt.figure(figsize=(NATURE_W, NATURE_H), facecolor='white')
+gs = gridspec.GridSpec(2, 2, figure=fig,
+                       width_ratios=[1.5, 1.0],
+                       height_ratios=[1.1, 0.85],
+                       hspace=0.42, wspace=0.22,
+                       left=0.07, right=0.97,
+                       top=0.97, bottom=0.07)
+
+# ── Panel (a): EDHI map ───────────────────────────────────────────────────────
+log_step('  Panel (a): EDHI map...')
+ax_a = fig.add_subplot(gs[0, 0], projection=PROJ)
+base_map(ax_a)
+
+muni_stats.plot(column='EDHI', ax=ax_a, cmap=EDHI_CMAP, norm=enorm,
+                linewidth=0.03, edgecolor='none', legend=False,
+                transform=PROJ, missing_kwds={'color': '#dddddd'})
+
+# Colorbar below map
+pos_a = ax_a.get_position()
+ax_cb = fig.add_axes([pos_a.x0, pos_a.y0 - 0.048,
+                       pos_a.width * 0.88, 0.014])
+sm_a = plt.cm.ScalarMappable(cmap=EDHI_CMAP, norm=enorm)
+sm_a.set_array([])
+cb_a = fig.colorbar(sm_a, cax=ax_cb, orientation='horizontal')
+cb_a.set_label(
+    'EDHI  (blue: extent overestimates hazard  |  red: underestimates)',
+    fontsize=5.5, labelpad=3)
+cb_a.ax.tick_params(labelsize=5.5, length=2.5)
+cb_a.ax.axvline(0, color='#222', lw=0.9, zorder=5)
+
+# Directional annotations -- placed to avoid overlap
+ax_a.annotate('Extent\noverstates hazard\n(Amazon floodplain)',
+              xy=(-60, -2), xytext=(-71, -16),
+              xycoords=PROJ._as_mpl_transform(ax_a),
+              textcoords=PROJ._as_mpl_transform(ax_a),
+              fontsize=5, color='#2166ac', fontweight='bold',
+              arrowprops=dict(arrowstyle='->', color='#2166ac',
+                              lw=0.7, connectionstyle='arc3,rad=0.3'),
+              ha='center', va='center')
+ax_a.annotate('Extent\nunderstates hazard\n(southern catchments)',
+              xy=(-50, -28), xytext=(-42, -22),
+              xycoords=PROJ._as_mpl_transform(ax_a),
+              textcoords=PROJ._as_mpl_transform(ax_a),
+              fontsize=5, color='#b2182b', fontweight='bold',
+              arrowprops=dict(arrowstyle='->', color='#b2182b',
+                              lw=0.7, connectionstyle='arc3,rad=-0.3'),
+              ha='center', va='center')
+
+panel_label(ax_a, 'a')
+ax_a.set_title('Extent-Hazard Discrepancy Index (EDHI)',
+               fontsize=7, pad=4, loc='left', fontweight='bold')
+
+# ── Panel (b): Scatter — flood extent vs HAND median ─────────────────────────
+log_step('  Panel (b): scatter...')
+ax_b = fig.add_subplot(gs[0, 1])
+
+# Use clipped data and log scale to handle outliers properly
+for region, color in REGION_COLORS.items():
+    sub = df_fig_clipped[df_fig_clipped['macro_region'] == region]
+    if len(sub) == 0:
+        continue
+    ax_b.scatter(sub['flood_frac'] * 100,
+                 sub['hand_p50_m'],
+                 c=color, s=5, alpha=0.55, linewidths=0,
+                 label=region, rasterized=True, zorder=2)
+
+# Trend line on clipped data
+_x = df_fig_clipped['flood_frac'] * 100
+_y = df_fig_clipped['hand_p50_m']
+_z = np.polyfit(_x, _y, 1)
+_xl = np.linspace(_x.quantile(0.01), _x.quantile(0.99), 200)
+ax_b.plot(_xl, np.poly1d(_z)(_xl), color='#333', lw=1.0,
+          ls='--', alpha=0.7,
+          label='Trend (rho={:.2f})'.format(rho_nat),
+          zorder=5)
+
+ax_b.set_xlim(left=0, right=df_fig_clipped['flood_frac'].quantile(0.99) * 102)
+ax_b.set_ylim(bottom=0, top=hand_p99 * 1.05)
+
+# Annotation box -- placed bottom right, away from data cloud
+ax_b.text(0.98, 0.04,
+          'If extent tracked hazard,\nHAND would rise with\nflooded area. It does not.',
+          transform=ax_b.transAxes, fontsize=5.5,
+          ha='right', va='bottom', color='#333', style='italic',
+          bbox=dict(boxstyle='round,pad=0.35', facecolor='#fffde7',
+                    edgecolor='#e6c800', lw=0.6, alpha=0.95))
+
+ax_b.set_xlabel('Relative flood extent (% of municipal area)', fontsize=6.5)
+ax_b.set_ylabel('HAND median in\nflooded pixels (m)', fontsize=6.5)
+
+# Legend outside plot area -- upper left, not overlapping data
+leg_b = ax_b.legend(title='Macro-region', title_fontsize=5.5,
+                    loc='upper right', fontsize=5.2,
+                    markerscale=2.0, handletextpad=0.3,
+                    borderaxespad=0.4, labelspacing=0.25,
+                    framealpha=0.95, edgecolor='#cccccc')
+leg_b.get_frame().set_linewidth(0.5)
+
+panel_label(ax_b, 'b')
+ax_b.set_title('Flood extent vs terrain height (HAND median)',
+               fontsize=7, pad=4, loc='left', fontweight='bold')
+
+# ── Panel (c): Boxplot HAND by extent quartile ───────────────────────────────
+log_step('  Panel (c): boxplot...')
+ax_c = fig.add_subplot(gs[1, 0])
+
+quartile_colors = ['#4575b4', '#74add1', '#fdae61', '#d73027']
+_groups = [df_fig[df_fig['extent_quartile'] == q]['hand_p50_m'].dropna().values
+           for q in qlabels]
+
+# Clip each group to 99th percentile for display
+_groups_disp = [np.clip(g, 0, np.percentile(g, 99)) if len(g) > 0 else g
+                for g in _groups]
+
+bp = ax_c.boxplot(_groups_disp,
+                  positions=range(len(qlabels)),
+                  widths=0.52,
+                  patch_artist=True,
+                  medianprops=dict(color='white', lw=1.8),
+                  whiskerprops=dict(lw=0.8, color='#555'),
+                  capprops=dict(lw=0.8, color='#555'),
+                  flierprops=dict(marker='.', markersize=2,
+                                  alpha=0.25, markeredgewidth=0,
+                                  markerfacecolor='#888'))
+
+for patch, color in zip(bp['boxes'], quartile_colors):
+    patch.set_facecolor(color)
+    patch.set_alpha(0.82)
+    patch.set_linewidth(0.6)
+
+# Jittered points (sampled, clipped)
+rng = np.random.default_rng(42)
+for i, (grp_disp, color) in enumerate(zip(_groups_disp, quartile_colors)):
+    if len(grp_disp) == 0:
+        continue
+    n_pts = min(len(grp_disp), 250)
+    idx = rng.choice(len(grp_disp), n_pts, replace=False)
+    sample = grp_disp[idx]
+    jitter = rng.uniform(-0.20, 0.20, size=n_pts)
+    ax_c.scatter(i + jitter, sample,
+                 c=color, s=3, alpha=0.22, linewidths=0, zorder=3)
+
+# Median labels -- positioned BELOW the median line to avoid overlap
+for i, grp in enumerate(_groups):
+    if len(grp) == 0:
+        continue
+    med = np.median(grp)
+    # Place label inside the box, below the white median line
+    ax_c.text(i, med * 0.55 if med > 3 else med + 0.3,
+              '{:.1f} m'.format(med),
+              ha='center', va='center', fontsize=6,
+              color='white', fontweight='bold', zorder=10)
+
+ax_c.set_xticks(range(len(qlabels)))
+ax_c.set_xticklabels(qlabels, fontsize=6.5, linespacing=1.2)
+ax_c.set_xlabel('Flood extent quartile', fontsize=6.5)
+ax_c.set_ylabel('HAND median in flooded pixels (m)', fontsize=6.5)
+
+# Key annotation -- bottom right, away from boxes
+ax_c.text(0.98, 0.97,
+          'If extent ~ hazard:\nHAND should rise Q1->Q4.\nOverlapping distributions\nprove the proxy fails.',
+          transform=ax_c.transAxes, fontsize=5.5,
+          ha='right', va='top', color='#333', style='italic',
+          bbox=dict(boxstyle='round,pad=0.35', facecolor='#fffde7',
+                    edgecolor='#e6c800', lw=0.6, alpha=0.95))
+
+panel_label(ax_c, 'c')
+ax_c.set_title('HAND median across flood extent quartiles',
+               fontsize=7, pad=4, loc='left', fontweight='bold')
+
+# ── Panel (d): Spearman rho by macro-region ───────────────────────────────────
+log_step('  Panel (d): Spearman rho by region...')
+ax_d = fig.add_subplot(gs[1, 1])
+
+regs = [r for r in MACRO_REGIONS if r in reg]
+rhos = [reg[r]['rho'] for r in regs]
+ns   = [reg[r]['n']   for r in regs]
+pvs  = [reg[r]['pval'] for r in regs]
+order  = np.argsort(rhos)
+regs_s = [regs[i] for i in order]
+rhos_s = [rhos[i] for i in order]
+ns_s   = [ns[i]   for i in order]
+pvs_s  = [pvs[i]  for i in order]
+clrs_s = [REGION_COLORS.get(regs_s[i], '#aaa') for i in range(len(regs_s))]
+sig_s  = ['*' if p < 0.05 else 'n.s.' for p in pvs_s]
+y_pos  = np.arange(len(regs_s))
+
+bars = ax_d.barh(y_pos, rhos_s, color=clrs_s,
+                 height=0.60, edgecolor='white', linewidth=0.4, zorder=2)
+
+# Weak proxy zone shading
+ax_d.axvspan(-0.3, 0.3, alpha=0.07, color='#d73027', zorder=0)
+
+ax_d.axvline(rho_nat, color='#333', lw=1.0, ls='--', alpha=0.85, zorder=4,
+             label='National rho = {:.3f}'.format(rho_nat))
+ax_d.axvline(0, color='#888', lw=0.6, zorder=1)
+
+# n= labels -- always on the outside of the bar with enough margin
+for bar, n, sig in zip(bars, ns_s, sig_s):
+    w   = bar.get_width()
+    # Place label always to the right for readability
+    ax_d.text(ax_d.get_xlim()[1] if ax_d.get_xlim()[1] < 0.85 else 0.82,
+              bar.get_y() + bar.get_height() / 2,
+              'n={:,} {}'.format(n, sig),
+              va='center', ha='right', fontsize=5.5, color='#333')
+
+ax_d.set_yticks(y_pos)
+ax_d.set_yticklabels(regs_s, fontsize=6.5)
+ax_d.set_xlabel('Spearman rho  (flood extent vs HAND median)', fontsize=6.5)
+ax_d.set_xlim(-0.28, 0.82)
+ax_d.tick_params(axis='y', length=0)
+
+leg_d = ax_d.legend(fontsize=5.5, loc='lower right',
+                    framealpha=0.9, handlelength=1.5)
+leg_d.get_frame().set_linewidth(0.5)
+ax_d.text(0.02, -0.14, '* p < 0.05   n.s. not significant',
+          transform=ax_d.transAxes, fontsize=5.5, color='#666')
+
+panel_label(ax_d, 'd')
+ax_d.set_title('Regional variation in extent-hazard correlation',
+               fontsize=7, pad=4, loc='left', fontweight='bold')
+
+# No figure-level title (caption provided in manuscript)
+
+# --- Save ---
+log_step('Saving composite figure at 500 dpi...')
+_base = 'Figure1_flood_extent_vs_hydraulic_hazard_Brazil'
+fig.savefig(OUT_FIGS / (_base + '.pdf'), dpi=500,
+            bbox_inches='tight', facecolor='white')
+fig.savefig(OUT_FIGS / (_base + '.png'), dpi=500,
+            bbox_inches='tight', facecolor='white')
+log_step('Saved: ' + _base + '.pdf + .png (500 dpi)', 'ok')
+IPydisplay.display(fig)
+plt.close(fig)
+log_step('Block 8 complete', 'ok')
+
+
+
+# BLOCK 9 — EXPORTS AND MANUSCRIPT NUMBERS
+# =============================================================================
+
+log_step('Exporting outputs...')
+(OUT_DATA / 'flood_hand_municipalities_BR.csv').write_bytes(
+    muni_stats_df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig'))
+log_step('CSV exported', 'ok')
+
+muni_stats.to_file(OUT_DATA / 'municipalities_flood_hand_BR.geojson', driver='GeoJSON')
+log_step('GeoJSON exported', 'ok')
+
+(OUT_STAT / 'statistical_results.json').write_text(json.dumps(stat_results, indent=2))
+log_step('Stats JSON exported', 'ok')
+
+def start_raster_export(image, desc):
+    t = ee.batch.Export.image.toDrive(
+        image=image.toFloat(), description=desc,
+        folder=DRIVE_FOLDER, fileNamePrefix=desc,
+        scale=SCALE_M, region=brazil.bounds(),
+        crs='EPSG:4326', maxPixels=1e10, fileFormat='GeoTIFF')
+    t.start()
+    log_step(f'Raster queued: {desc} [{t.id}]', 'ok')
+
+start_raster_export(flood_freq,       f'flood_frequency_{SCALE_M}m')
+start_raster_export(flood_extent_max, f'flood_extent_{SCALE_M}m')
+start_raster_export(hand_class,       f'hand_classes_{SCALE_M}m')
+log_step('Rasters queued — https://code.earthengine.google.com/tasks', 'info')
+
+# Manuscript numbers
+sl = stat_results.get('spatial_lag_model',{})
+mi = stat_results.get('morans_I',{})
+print('\n' + '='*70)
+print('KEY NUMBERS FOR MANUSCRIPT')
+print('='*70)
+print(f'Total municipalities (IBGE)  : {len(muni_gdf):,}')
+print(f'Municipalities with flood    : {(muni_stats_df["flood_area_km2_sum"]>0).sum():,}')
+print(f'Total flooded area (1km)     : {muni_stats_df["flood_area_km2_sum"].sum():,.0f} km2')
+_rho = stat_results.get("spearman_national",{}).get("rho","?")
+_pval = stat_results.get("spearman_national",{}).get("pval","?")
+_n   = stat_results.get("spearman_national",{}).get("n","?")
+_fp  = stat_results.get("classification_matrix",{}).get("FP",0)
+_fn  = stat_results.get("classification_matrix",{}).get("FN",0)
+_fpr = stat_results.get("classification_matrix",{}).get("false_positive_rate",0)
+_fnr = stat_results.get("classification_matrix",{}).get("false_negative_rate",0)
+_mcc = stat_results.get("classification_matrix",{}).get("MCC",0)
+print(f'Spearman rho (national)      : {_rho}  (p={_pval:.2e}, n={_n:,})')
+print(f'False positive rate          : {_fpr*100:.1f}%  ({_fp:,} municipalities)')
+print(f'False negative rate          : {_fnr*100:.1f}%  ({_fn:,} municipalities)')
+print(f'MCC                          : {_mcc:.4f}')
+print(f"Moran's I on EDHI            : {mi.get('I','?')}  (p={mi.get('pval','?')})")
+print(f'Spatial lag rho (SLM)        : {sl.get("rho_spatial","?")}')
+print(f'SLM pseudo-R2                : {sl.get("pseudo_r2","?")}')
+print('='*70)
+log_step('PIPELINE COMPLETE', 'ok')
