@@ -1,0 +1,271 @@
+# RSL — ONE-CELL PIPELINE FOR FIVE INDEPENDENT MAIN FIGURES (v16)
+# Offline: reuses completed Drive outputs; never calls Earth Engine or downloads datasets.
+import sys, subprocess, importlib.util
+for module, package in [('geopandas','geopandas'),('pyarrow','pyarrow'),('scipy','scipy')]:
+    if importlib.util.find_spec(module) is None:
+        subprocess.check_call([sys.executable,'-m','pip','install','-q',package])
+import json, warnings
+from pathlib import Path
+from datetime import datetime, timezone
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from matplotlib.colors import ListedColormap
+from scipy.stats import spearmanr
+from tqdm.auto import tqdm
+from IPython.display import display
+warnings.filterwarnings('ignore', category=FutureWarning)
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')
+except ImportError:
+    pass
+ROOT=Path('/content/drive/MyDrive/flood_extent_vs_hydraulic_hazard_brazil')
+BASE=ROOT/'RSL_LETTER'/'ATLAS_VALIDATION_OFFLINE'
+OUT=ROOT/'RSL_LETTER'/'FIVE_FINAL_LETTER_FIGURES_v16'
+OUT.mkdir(parents=True,exist_ok=True)
+SOURCES={
+ 'municipal':BASE/'tables'/'municipal_satellite_atlas_2000_2018.csv',
+ 'census':BASE/'POPULATION_EXPOSURE_TEST_v6'/'source'/'ibge_census_2010_population_municipal.csv',
+ 'geometries':ROOT/'checkpoints'/'municipios_ibge_2022.parquet',
+ 'cv':BASE/'POPULATION_EXPOSURE_TEST_v6'/'tables'/'population_spatial_cv_folds.csv',
+ 'predictions':BASE/'POPULATION_EXPOSURE_TEST_v6'/'tables'/'population_spatial_cv_predictions.csv',
+ 'folds':BASE/'POPULATION_EXPOSURE_TEST_v6'/'tables'/'fold_membership.csv',
+ 'state_errors':BASE/'SPATIAL_VALIDATION_AUDIT_v5'/'tables'/'state_prediction_diagnostics.csv',
+ 'temporal_cv':BASE/'TEMPORAL_ROBUSTNESS_v7'/'tables'/'temporal_spatial_cv_folds.csv',
+ 'coverage':BASE/'TEMPORAL_ROBUSTNESS_v7'/'tables'/'historical_window_coverage.csv',
+ 'temporal_gains':BASE/'TEMPORAL_ROBUSTNESS_v7'/'tables'/'temporal_incremental_comparisons.csv',
+}
+print('RSL FIVE-FIGURE PIPELINE | NO GEE | NO DOWNLOADS')
+for label,path in SOURCES.items():
+    if not path.is_file(): raise FileNotFoundError(f'Required cached file missing: {label}: {path}')
+print('All existing scientific checkpoints found.')
+
+def code(s):
+    return s.astype('string').str.strip().str.replace(r'\.0$', '',regex=True).str.zfill(7)
+def numeric(df, names):
+    for c in names: df[c]=pd.to_numeric(df[c], errors='coerce')
+def tag(ax,letter,title):
+    ax.set_title(f'{letter}   {title}',loc='left',fontsize=10,fontweight='bold',pad=9)
+def cosmetic(ax,grid='y'):
+    ax.grid(axis=grid,color='#dadde1',linewidth=.45,alpha=.62,zorder=0)
+    ax.spines[['top','right']].set_visible(False)
+    ax.tick_params(length=3,width=.6)
+def export(fig,stem):
+    for extension in ('png','pdf'):
+        fig.savefig(OUT/f'{stem}.{extension}',dpi=450,bbox_inches='tight',facecolor='white')
+    plt.show();plt.close(fig)
+    print('SAVED',stem+'.png / .pdf')
+
+mpl.rcParams.update({'font.family':'DejaVu Sans','font.size':9,'axes.titlesize':10,
+                     'axes.labelsize':9,'xtick.labelsize':8,'ytick.labelsize':8,
+                     'pdf.fonttype':42,'ps.fonttype':42,'axes.linewidth':.7})
+C={'LL':'#c9cdd1','HL':'#387eae','LH':'#d48938','HH':'#805078'}
+LABEL={'LL':'Low coverage / low reporting','HL':'High coverage / low reporting',
+       'LH':'Low coverage / high reporting','HH':'High coverage / high reporting'}
+MOD_COL={'Train-mean baseline':'#9fa4aa','Extent only':'#3f8ab9','Terrain only':'#b5a3bf',
+         'Extent + terrain':'#669c85','Population only':'#cb9158',
+         'Population + extent':'#5895b8','Population + terrain':'#9b80aa',
+         'Population + extent + terrain':'#785077'}
+print('[1/6] Loading municipal data, census and geometries')
+raw=pd.read_csv(SOURCES['municipal'],dtype={'CD_MUN':'string'},low_memory=False)
+pop=pd.read_csv(SOURCES['census'],dtype={'CD_MUN':'string'},low_memory=False)
+raw['CD_MUN']=code(raw.CD_MUN);pop['CD_MUN']=code(pop.CD_MUN)
+required=['CD_MUN','extent_fraction','low_hand_fraction','reported_floods']
+for name,df,cols in [('municipal',raw,required),('census',pop,['CD_MUN','population_2010'])]:
+    missing=set(cols)-set(df.columns)
+    if missing: raise ValueError(f'{name} missing {missing}')
+    if df.CD_MUN.duplicated().any():raise ValueError(f'{name} duplicated municipal identifiers')
+more=[c for c in ['deaths','displaced','homeless','affected'] if c in raw.columns]
+dat=raw[required+more].merge(pop[['CD_MUN','population_2010']],on='CD_MUN',how='left',validate='one_to_one')
+numeric(dat,required[1:]+more+['population_2010'])
+dat=dat.dropna(subset=required[1:]+['population_2010']).copy()
+dat=dat[dat.population_2010>0].copy()
+assert len(dat)>=5500, f'Unexpected matched n={len(dat)}'
+for c in ['extent_fraction','low_hand_fraction']:
+    if (~dat[c].between(0,1)).any():raise ValueError(f'Fraction outside [0,1]: {c}')
+dat['reported_rate_10k']=dat.reported_floods/dat.population_2010*10000
+dat['UF']=dat.CD_MUN.str[:2]
+# Predefined, disclosed descriptive dichotomies, not measures of physical severity.
+ext_thr=float(dat.extent_fraction.median());rate_thr=float(dat.reported_rate_10k.median())
+dat['class_code']=np.select([
+ (~dat.extent_fraction.gt(ext_thr)) & (~dat.reported_rate_10k.gt(rate_thr)),
+ (dat.extent_fraction.gt(ext_thr) & (~dat.reported_rate_10k.gt(rate_thr))),
+ ((~dat.extent_fraction.gt(ext_thr)) & dat.reported_rate_10k.gt(rate_thr))],['LL','HL','LH'],default='HH')
+order=['LL','HL','LH','HH']; counts=dat.class_code.value_counts().reindex(order,fill_value=0)
+if counts.eq(0).any():raise ValueError(f'Empty typology categories: {counts.to_dict()}')
+geom=pd.read_parquet(SOURCES['geometries']);geom['CD_MUN']=code(geom.CD_MUN)
+if 'geometry_wkt' in geom.columns:
+    geo=gpd.GeoDataFrame(geom.drop(columns=['geometry','geometry_wkt'],errors='ignore'),
+        geometry=gpd.GeoSeries.from_wkt(geom.geometry_wkt,crs='EPSG:4326'),crs='EPSG:4326')
+elif 'geometry' in geom.columns:
+    sample=geom['geometry'].dropna().iloc[0]
+    if isinstance(sample,str):
+        geo=gpd.GeoDataFrame(geom.drop(columns=['geometry']),geometry=gpd.GeoSeries.from_wkt(geom.geometry,crs='EPSG:4326'),crs='EPSG:4326')
+    else: geo=gpd.GeoDataFrame(geom,geometry='geometry',crs='EPSG:4326')
+else:raise ValueError('No municipality geometry available')
+if geo.CD_MUN.duplicated().any():raise ValueError('Duplicated municipal geometry')
+gmap=geo[['CD_MUN','geometry']].merge(dat[['CD_MUN','class_code','reported_floods','extent_fraction']],on='CD_MUN',how='left',validate='one_to_one')
+
+print('[2/6] Figure 1 — spatial typology and independent terrain comparison')
+fig=plt.figure(figsize=(12.8,7.4));gs=fig.add_gridspec(2,3,width_ratios=[1.65,1,1],left=.045,right=.97,top=.92,bottom=.15,wspace=.36,hspace=.40)
+a=fig.add_subplot(gs[:,0]);b=fig.add_subplot(gs[0,1]);c=fig.add_subplot(gs[0,2]);d=fig.add_subplot(gs[1,1]);e=fig.add_subplot(gs[1,2])
+if gmap.class_code.isna().any():gmap[gmap.class_code.isna()].plot(ax=a,color='#f0f0f0',edgecolor='none',rasterized=True)
+for cls in order:gmap[gmap.class_code==cls].plot(ax=a,color=C[cls],edgecolor='none',rasterized=True)
+a.axis('off');tag(a,'a','Municipal reporting–coverage classes')
+a.legend(handles=[Patch(facecolor=C[x],label=f'{LABEL[x]} (n={counts[x]:,})') for x in order],
+         loc='lower center',bbox_to_anchor=(.5,-.11),frameon=False,fontsize=7)
+def boxes(ax,column,factor,title,ylabel):
+    arrays=[dat.loc[dat.class_code==x,column].to_numpy()*factor for x in order]
+    bp=ax.boxplot(arrays,patch_artist=True,widths=.56,showfliers=False,medianprops={'color':'#222','linewidth':1.2})
+    for patch,x in zip(bp['boxes'],order):patch.set(facecolor=C[x],edgecolor='#555',linewidth=.6)
+    ax.set_xticks(range(1,5),order);ax.set_ylabel(ylabel);tag(ax,title[0],title[1:]);cosmetic(ax)
+boxes(b,'extent_fraction',100,'bCoverage distribution','Municipality flooded (%)')
+boxes(c,'reported_rate_10k',1,'cReporting-rate distribution','Atlas records / 10,000 residents')
+boxes(d,'low_hand_fraction',100,'dLow-HAND terrain by class','Municipal terrain with HAND ≤ 10 m (%)')
+for cls in order:
+    q=dat[dat.class_code==cls]
+    e.scatter(q.extent_fraction*100,q.reported_rate_10k,s=7,alpha=.25,color=C[cls],edgecolors='none',rasterized=True)
+e.set(xlabel='Municipality flooded (%)',ylabel='Records / 10,000 residents')
+e.set_xlim(0,max(1,float(dat.extent_fraction.quantile(.995)*108)))
+e.set_ylim(0,float(dat.reported_rate_10k.quantile(.995)*1.08))
+rho=spearmanr(dat.extent_fraction,dat.reported_rate_10k).statistic
+e.text(.98,.96,f'Spearman ρ = {rho:.3f}\nn = {len(dat):,}',transform=e.transAxes,ha='right',va='top',fontsize=8)
+tag(e,'e','Coverage and reporting rates');cosmetic(e,'both')
+fig.suptitle('Figure 1  |  Geographic discordance between satellite coverage and flood reporting',fontweight='bold',fontsize=13,y=.985)
+fig.text(.04,.025,f'Median thresholds: flood coverage = {ext_thr:.6f}; records / 10,000 (2010 population) = {rate_thr:.3f}. '
+         'Classes are descriptive; reporting is not physical flood severity.',fontsize=7.5)
+export(fig,'Figure1_spatial_typology')
+
+print('[3/6] Figure 2 — coverage, terrain, recorded consequences')
+fig=plt.figure(figsize=(12.8,6.5));gs=fig.add_gridspec(2,3,width_ratios=[1.45,1,1],left=.05,right=.97,top=.91,bottom=.12,wspace=.38,hspace=.44)
+a=fig.add_subplot(gs[:,0]);b=fig.add_subplot(gs[0,1]);c=fig.add_subplot(gs[0,2]);d=fig.add_subplot(gs[1,1]);e=fig.add_subplot(gs[1,2])
+gmap['log1p_records']=np.log1p(gmap.reported_floods)
+gmap.plot(column='log1p_records',ax=a,cmap='YlOrBr',legend=True,legend_kwds={'shrink':.57,'label':'log(1 + records)'},missing_kwds={'color':'#eeeeee'},linewidth=0,rasterized=True)
+a.axis('off');tag(a,'a','Atlas administrative records, 2000–2018')
+for ax,xcol,lab,letter in [(b,'extent_fraction','Municipality flooded (%)','b'),(c,'low_hand_fraction','Low-HAND terrain (%)','c')]:
+    x=dat[xcol]*100;y=np.log1p(dat.reported_floods)
+    ax.hexbin(x,y,gridsize=33,mincnt=1,bins='log',cmap='Blues' if letter=='b' else 'Purples',linewidths=0)
+    ax.set(xlabel=lab,ylabel='log(1 + Atlas records)')
+    val=spearmanr(x,dat.reported_floods).statistic
+    tag(ax,letter,f'ρ = {val:.3f}; n = {len(dat):,}');cosmetic(ax)
+impacts=['deaths','displaced','homeless','affected']
+rows=[]
+for impact in impacts:
+    if impact not in dat:continue
+    q=dat[['extent_fraction','low_hand_fraction',impact]].dropna()
+    if len(q)<50:continue
+    rows.append((impact,len(q),spearmanr(q.extent_fraction,q[impact]).statistic,spearmanr(q.low_hand_fraction,q[impact]).statistic))
+if rows:
+    tab=pd.DataFrame(rows,columns=['outcome','n','extent_rho','terrain_rho'])
+    yy=np.arange(len(tab));d.barh(yy-.17,tab.extent_rho,height=.32,color='#397ea9',label='Coverage');d.barh(yy+.17,tab.terrain_rho,height=.32,color='#855987',label='Low-HAND')
+    d.set_yticks(yy,tab.outcome);d.axvline(0,color='#555',lw=.7);d.legend(frameon=False,fontsize=7);d.set_xlabel('Spearman ρ');tag(d,'d','Associations with reported human impacts');cosmetic(d,'x')
+else:
+    d.text(.5,.5,'No compatible impact columns',ha='center',va='center',transform=d.transAxes);d.axis('off')
+region_code={'11':'RO','12':'AC','13':'AM','14':'RR','15':'PA','16':'AP','17':'TO','21':'MA','22':'PI','23':'CE','24':'RN','25':'PB','26':'PE','27':'AL','28':'SE','29':'BA','31':'MG','32':'ES','33':'RJ','35':'SP','41':'PR','42':'SC','43':'RS','50':'MS','51':'MT','52':'GO','53':'DF'}
+dat['state']=dat.CD_MUN.str[:2].map(region_code)
+statecorr=[]
+for st,q in dat.groupby('state'):
+    if len(q)>=12 and q.extent_fraction.nunique()>1 and q.reported_floods.nunique()>1:
+        statecorr.append((st,len(q),spearmanr(q.extent_fraction,q.reported_floods).statistic))
+statecorr=pd.DataFrame(statecorr,columns=['UF','n','rho']).sort_values('rho')
+e.axvline(0,lw=.8,color='#444')
+e.scatter(statecorr.rho,np.arange(len(statecorr)),s=20,color='#387eae')
+e.set_yticks(np.arange(len(statecorr)),statecorr.UF);e.set(xlabel='Spearman ρ',ylabel='');tag(e,'e','State-level associations');cosmetic(e,'x')
+fig.suptitle('Figure 2  |  Remote-sensing indicators and administrative flood records',fontsize=13,fontweight='bold',y=.985)
+fig.text(.05,.022,'Associations are descriptive, not event-matched. Impact counts and reporting frequencies are not measures of hydraulic intensity.',fontsize=7.5)
+export(fig,'Figure2_reported_impacts')
+
+print('[4/6] Figure 3 — population adjustment and added predictive value')
+cv=pd.read_csv(SOURCES['cv']);pred=pd.read_csv(SOURCES['predictions'])
+for col in ['fold','mae_log','r2']:
+    if col not in cv:raise ValueError(f'Missing CV column {col}')
+expected=['Train-mean baseline','Extent only','Population only','Population + extent','Population + terrain','Population + extent + terrain']
+for name in expected:
+    if name not in set(cv.model):raise ValueError(f'Missing required model {name}')
+s=cv.groupby('model',as_index=False).agg(mae=('mae_log','mean'),r2=('r2','mean'))
+s=s.set_index('model').reindex(expected).reset_index()
+fig,axs=plt.subplots(2,2,figsize=(12.5,7.5),gridspec_kw={'hspace':.47,'wspace':.40},layout='constrained')
+a,b,c,d=axs.flatten();y=np.arange(len(s))
+a.barh(y,s.mae,color=[MOD_COL[x] for x in s.model],height=.63);a.set_yticks(y,s.model);a.invert_yaxis();a.set_xlabel('Mean held-out MAE, log count');tag(a,'a','Model error');cosmetic(a,'x')
+b.barh(y,s.r2,color=[MOD_COL[x] for x in s.model],height=.63);b.set_yticks(y,s.model);b.invert_yaxis();b.axvline(0,color='#444',lw=.7);b.set_xlabel('Mean held-out R²');tag(b,'b','Out-of-state generalization');cosmetic(b,'x')
+wide=cv.pivot(index='fold',columns='model',values='mae_log')
+comparisons=[('Pop. → + coverage','Population only','Population + extent'),('Pop. → + terrain','Population only','Population + terrain'),('Pop. → both','Population only','Population + extent + terrain'),('Pop. + coverage → both','Population + extent','Population + extent + terrain')]
+for k,(lab,base,alt) in enumerate(comparisons):
+    delta=wide[base]-wide[alt]
+    c.plot([k]*len(delta),delta,'o',color='#aeb8bf',ms=4,alpha=.9)
+    c.plot(k,delta.mean(),'D',color='#805078',ms=7)
+c.axhline(0,color='#555',lw=.85);c.set_xticks(range(len(comparisons)),[x[0] for x in comparisons],rotation=15,ha='right');c.set_ylabel('MAE reduction (+ = improvement)');tag(c,'c','Incremental gains across 5 folds');cosmetic(c)
+for name in ['Population only','Population + extent + terrain']:
+    q=cv[cv.model==name].sort_values('fold')
+    d.plot(q.fold,q.mae_log,'-o',label=name,color=MOD_COL[name],lw=1.8,ms=5)
+d.set_xticks(sorted(cv.fold.unique()));d.set(xlabel='Held-out fold',ylabel='MAE, log count');d.legend(frameon=False,fontsize=8);tag(d,'d','Fold-specific error');cosmetic(d)
+fig.suptitle('Figure 3  |  Population explains more than mapped flood coverage alone',fontsize=13,fontweight='bold')
+export(fig,'Figure3_population_adjusted_models')
+
+print('[5/6] Figure 4 — geographical transferability')
+state=pd.read_csv(SOURCES['state_errors']);folds=pd.read_csv(SOURCES['folds'])
+needed={'UF','model','mae_log'}
+if not needed.issubset(state):raise ValueError(f'State diagnostics missing {needed-set(state.columns)}')
+q=state[state.model.isin(['Train-mean baseline','Extent only','Extent + terrain'])].pivot(index='UF',columns='model',values='mae_log')
+q=q.dropna().sort_values('Extent only')
+fig,axs=plt.subplots(1,3,figsize=(13.7,7.2),gridspec_kw={'width_ratios':[1.5,1.1,1.0]},layout='constrained')
+a,b,c=axs;yy=np.arange(len(q))
+for name,offset in [('Train-mean baseline',-.24),('Extent only',0),('Extent + terrain',.24)]:
+    a.scatter(q[name],yy+offset,s=18,color=MOD_COL[name],label=name)
+a.set_yticks(yy,q.index);a.invert_yaxis();a.set_xlabel('Held-out state MAE');a.legend(frameon=False,fontsize=7,loc='lower right');tag(a,'a','Geographic prediction error');cosmetic(a,'x')
+dif=q['Extent + terrain']-q['Extent only'];b.barh(yy,dif,color=np.where(dif>0,'#be765c','#539c82'),height=.64)
+b.set_yticks(yy,q.index);b.invert_yaxis();b.axvline(0,color='#444',lw=.75);b.set_xlabel('MAE(both) − MAE(coverage)');tag(b,'b','Terrain addition by state');cosmetic(b,'x')
+if not {'fold','heldout_states','n_test'}.issubset(folds):raise ValueError('Fold membership table schema mismatch')
+folds=folds.sort_values('fold');c.barh(np.arange(len(folds)),folds.n_test,color='#6988a3',height=.55)
+c.set_yticks(np.arange(len(folds)),['Fold '+str(i) for i in folds.fold]);c.invert_yaxis();c.set_xlabel('Test municipalities');tag(c,'c','State-block validation design');cosmetic(c,'x')
+for j,txt in enumerate(folds.heldout_states):
+    c.text(.02,j+.35,str(txt).replace(';',' · '),transform=c.get_yaxis_transform(),fontsize=6.6,ha='left',va='bottom')
+fig.suptitle('Figure 4  |  Regional instability in model transferability',fontsize=13,fontweight='bold')
+export(fig,'Figure4_spatial_transferability')
+
+print('[6/6] Figure 5 — sensitivity to the administrative reporting window')
+tcv=pd.read_csv(SOURCES['temporal_cv']);cov=pd.read_csv(SOURCES['coverage']);gains=pd.read_csv(SOURCES['temporal_gains'])
+period=['2000–2006','2007–2012','2013–2018','2000–2012','2000–2018']
+for col in ['window','model','mae_log']:
+    if col not in tcv:raise ValueError(f'Temporal CV missing column {col}')
+M=['Train-mean baseline','Population only','Population + extent','Population + terrain','Population + extent + terrain']
+pivot=tcv.groupby(['window','model']).mae_log.mean().unstack().reindex(index=period,columns=M)
+if pivot.isna().any().any(): raise ValueError('Incomplete temporal model × period table')
+fig,axs=plt.subplots(2,2,figsize=(12.8,7.8),layout='constrained',gridspec_kw={'hspace':.30,'wspace':.30});a,b,c,d=axs.flatten()
+# Within-window comparison: normalize MAE by population-only for visual comparability.
+dif=pivot.sub(pivot['Population only'],axis=0)
+im=a.imshow(dif.to_numpy(),cmap='BrBG_r',aspect='auto',vmin=-max(abs(dif.to_numpy().min()),abs(dif.to_numpy().max())),vmax=max(abs(dif.to_numpy().min()),abs(dif.to_numpy().max())))
+a.set_xticks(np.arange(len(M)),['Baseline','Population','Pop.+cov.','Pop.+terrain','Full'],rotation=27,ha='right');a.set_yticks(np.arange(len(period)),period)
+for i in range(len(period)):
+    for j in range(len(M)):a.text(j,i,f'{dif.iloc[i,j]:+.3f}',ha='center',va='center',fontsize=7)
+tag(a,'a','ΔMAE against population-only, by window')
+for name in ['Population + extent','Population + terrain','Population + extent + terrain']:
+    delta=pivot['Population only']-pivot[name]
+    b.plot(range(len(period)),delta,'-o',label=name,lw=1.5,ms=4,color=MOD_COL[name])
+b.axhline(0,color='#444',lw=.7);b.set_xticks(range(len(period)),period,rotation=22,ha='right');b.set_ylabel('MAE reduction (+ = improvement)');b.legend(frameon=False,fontsize=7);tag(b,'b','Incremental value by reporting period');cosmetic(b)
+if not {'window','zero_fraction','atlas_records'}.issubset(cov):raise ValueError('Temporal coverage schema differs from expected')
+cc=cov.set_index('window').reindex(period)
+c.bar(np.arange(len(period)),(1-cc.zero_fraction)*100,color='#598eab');c.set_xticks(range(len(period)),period,rotation=22,ha='right');c.set_ylabel('Municipalities with ≥1 record (%)');tag(c,'c','Administrative reporting coverage');cosmetic(c)
+d.bar(np.arange(len(period)),cc.atlas_records,color='#a47b99');d.set_xticks(range(len(period)),period,rotation=22,ha='right');d.set_ylabel('Atlas flood records');tag(d,'d','Administrative event records');cosmetic(d)
+fig.suptitle('Figure 5  |  Historical reporting sensitivity (NOT prospective temporal validation)',fontsize=13,fontweight='bold')
+export(fig,'Figure5_temporal_reporting_sensitivity')
+
+# All reusable outputs and explicit scientific cautions.
+dat[['CD_MUN','extent_fraction','low_hand_fraction','reported_floods','population_2010','reported_rate_10k','class_code']].to_csv(OUT/'figure1_typology_data.csv',index=False)
+cv.to_csv(OUT/'figure3_fold_metrics.csv',index=False)
+pivot.to_csv(OUT/'figure5_temporal_model_mae.csv')
+manifest={'generated_utc':datetime.now(timezone.utc).isoformat(),'main_figures':[f'Figure{i}_{name}' for i,name in enumerate(['spatial_typology','reported_impacts','population_adjusted_models','spatial_transferability','temporal_reporting_sensitivity'],1)],
+ 'municipalities':len(dat),'coverage_median':ext_thr,'reporting_rate_median':rate_thr,
+ 'caveats':['Satellite coverage accumulated across 2000–2018, not event-level.','Atlas administrative flood records are not hydraulic severity.',
+ 'Typology groups are defined by the plotted variables; comparisons of those variables are descriptive by construction.',
+ '2010 population is a fixed historical reference, not annually varying exposed population.',
+ 'Temporal-window experiments reuse full-period satellite predictors and must not be presented as future prediction.',
+ 'Spatial cross-validation is held out by UF; state-level units remain dependent and five folds do not prove model superiority.',
+ 'No independent hydraulic validation is supplied.']}
+(OUT/'scientific_manifest.json').write_text(json.dumps(manifest,indent=2,ensure_ascii=False,default=str),encoding='utf-8')
+print('\nCOMPLETE: five independent composite figures, 10 image files, 4 audit tables/json.')
+print('Output folder:',OUT)
